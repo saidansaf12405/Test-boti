@@ -1,0 +1,3 @@
+➕  /addqestion --> yangi savol qo'shadi.
+📝  /editquestion --> savolni o'zgartiradi.
+❌  /delquestion --> savolni o'chiradi.

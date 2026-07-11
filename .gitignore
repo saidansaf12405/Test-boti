@@ -1,0 +1,35 @@
+# Maxfiy ma'lumotlar — HECH QACHON GitHub'ga yuklanmasin
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv/
+
+# Lokal AI model fayllari (juda katta, GitHub'ga sig'maydi)
+models/
+*.gguf
+
+# IDE / muharrir fayllari
+.vscode/
+.idea/
+*.swp
+
+# OS fayllari
+.DS_Store
+Thumbs.db
+
+# Log fayllar
+*.log
+
+# Baza backup fayllari
+*.sql
+!schema.sql
