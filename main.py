@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import random
 
@@ -15,7 +16,10 @@ from telegram.ext import (
 )
 
 import db
-from config import BOT_TOKEN, ADMIN_IDS, QUESTION_COUNT_OPTIONS, ADMIN_PANEL_USERNAME, ADMIN_PANEL_PASSWORD
+from config import (
+    BOT_TOKEN, ADMIN_IDS, QUESTION_COUNT_OPTIONS,
+    ADMIN_PANEL_USERNAME, ADMIN_PANEL_PASSWORD, LOCAL_LLM_PATH,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -26,6 +30,7 @@ logger = logging.getLogger(__name__)
 # ---------------- Conversation states (admin savol qo'shish) ----------------
 ASK_CATEGORY, ASK_QUESTION, ASK_CORRECT, ASK_WRONG1, ASK_WRONG2, ASK_WRONG3 = range(6)
 ADMIN_USERNAME, ADMIN_PASSWORD = range(6, 8)
+EDIT_MENU, EDIT_WAIT_VALUE = range(8, 10)
 
 ALL_CATEGORIES_MARKER = "__ALL__"
 
@@ -150,6 +155,7 @@ async def choose_count_callback(update: Update, context: ContextTypes.DEFAULT_TY
         correct_index = options.index(r["correct_answer"])
         questions.append(
             {
+                "id": r["id"],
                 "text": r["question_text"],
                 "options": options,
                 "correct_index": correct_index,
@@ -261,6 +267,14 @@ async def poll_answer_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if is_correct:
         quiz["correct_count"] += 1
+
+    # Har bir savol bo'yicha statistika uchun urinishni yozib qo'yamiz.
+    # Bu ishlamay qolsa ham (masalan vaqtinchalik baza muammosi) testning
+    # o'zi davom etishi kerak, shuning uchun xatoni yutib yuboramiz.
+    try:
+        await db.log_attempt(q["id"], poll_answer.user.id, is_correct)
+    except Exception:
+        logger.exception("Urinishni yozishda xato (question_id=%s)", q.get("id"))
 
     # 🎉 Poll xabariga reaksiya qo'yish (salyut effekti)
     try:
@@ -477,6 +491,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     added_count = context.user_data.pop("session_added", 0)
     context.user_data.pop("new_q", None)
     context.user_data.pop("current_category", None)
+    context.user_data.pop("edit_qid", None)
+    context.user_data.pop("edit_field", None)
     if added_count:
         await update.message.reply_text(
             f"❌ Bekor qilindi. Bu seansda {added_count} ta savol saqlangan edi."
@@ -484,6 +500,180 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Bekor qilindi.")
     return ConversationHandler.END
+
+
+# =====================================================================
+#                  /editquestion — SAVOLNI TAHRIRLASH
+# =====================================================================
+
+EDIT_FIELD_LABELS = {
+    "question_text": "Savol matni",
+    "correct_answer": "To'g'ri javob",
+    "wrong_answer1": "Noto'g'ri javob 1",
+    "wrong_answer2": "Noto'g'ri javob 2",
+    "wrong_answer3": "Noto'g'ri javob 3",
+    "category": "Kategoriya",
+}
+
+
+def _edit_menu_text(q) -> str:
+    return (
+        f"✏️ <b>Savolni tahrirlash</b> (ID: {q['id']})\n\n"
+        f"📁 Kategoriya: {q['category']}\n"
+        f"❓ Savol: {q['question_text']}\n"
+        f"✅ To'g'ri: {q['correct_answer']}\n"
+        f"❌ Noto'g'ri 1: {q['wrong_answer1']}\n"
+        f"❌ Noto'g'ri 2: {q['wrong_answer2']}\n"
+        f"❌ Noto'g'ri 3: {q['wrong_answer3']}\n\n"
+        "Qaysi maydonni o'zgartirmoqchisiz?"
+    )
+
+
+def _edit_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(label, callback_data=f"editf_{field}")]
+            for field, label in EDIT_FIELD_LABELS.items()]
+    rows.append([InlineKeyboardButton("✅ Tugatish", callback_data="editf_done")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def editquestion_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Bu buyruq faqat adminlar uchun.")
+        return ConversationHandler.END
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "Foydalanish: <code>/editquestion ID</code>\n"
+            "Masalan: <code>/editquestion 42</code>\n\n"
+            "ID raqamini admin statistikasidagi savollar ro'yxatidan yoki "
+            "bazadan (<code>SELECT id, question_text FROM questions ...</code>) topishingiz mumkin.",
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
+
+    qid = int(context.args[0])
+    q = await db.get_question_by_id(qid)
+    if not q:
+        await update.message.reply_text(f"⚠️ ID={qid} bilan savol topilmadi.")
+        return ConversationHandler.END
+
+    context.user_data["edit_qid"] = qid
+    await update.message.reply_text(
+        _edit_menu_text(q), parse_mode=ParseMode.HTML, reply_markup=_edit_menu_keyboard()
+    )
+    return EDIT_MENU
+
+
+async def editquestion_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    field = query.data.split("editf_", 1)[1]
+
+    if field == "done":
+        context.user_data.pop("edit_qid", None)
+        context.user_data.pop("edit_field", None)
+        await query.edit_message_text("✅ Tahrirlash tugatildi.")
+        return ConversationHandler.END
+
+    context.user_data["edit_field"] = field
+    await query.edit_message_text(
+        f"✏️ Yangi qiymatni yuboring — <b>{EDIT_FIELD_LABELS[field]}</b>:",
+        parse_mode=ParseMode.HTML,
+    )
+    return EDIT_WAIT_VALUE
+
+
+async def editquestion_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    qid = context.user_data.get("edit_qid")
+    field = context.user_data.get("edit_field")
+    new_value = update.message.text.strip()
+
+    if not qid or not field:
+        await update.message.reply_text("⚠️ Sessiya topilmadi, qaytadan /editquestion bilan boshlang.")
+        return ConversationHandler.END
+
+    try:
+        await db.update_question_field(qid, field, new_value)
+    except Exception:
+        logger.exception("Savolni yangilashda xato (id=%s, field=%s)", qid, field)
+        await update.message.reply_text("⚠️ Yangilashda xato yuz berdi.")
+        return ConversationHandler.END
+
+    q = await db.get_question_by_id(qid)
+    await update.message.reply_text("✅ Yangilandi!")
+    await update.message.reply_text(
+        _edit_menu_text(q), parse_mode=ParseMode.HTML, reply_markup=_edit_menu_keyboard()
+    )
+    return EDIT_MENU
+
+
+# =====================================================================
+#                  /delquestion — SAVOLNI O'CHIRISH
+# =====================================================================
+
+async def delquestion_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Bu buyruq faqat adminlar uchun.")
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "Foydalanish: <code>/delquestion ID</code>\n"
+            "Masalan: <code>/delquestion 42</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    qid = int(context.args[0])
+    q = await db.get_question_by_id(qid)
+    if not q:
+        await update.message.reply_text(f"⚠️ ID={qid} bilan savol topilmadi.")
+        return
+
+    qtext = q["question_text"]
+    if len(qtext) > 200:
+        qtext = qtext[:200] + "…"
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🗑 Ha, o'chirish", callback_data=f"delq_yes_{qid}"),
+                InlineKeyboardButton("❌ Bekor qilish", callback_data="delq_no"),
+            ]
+        ]
+    )
+    await update.message.reply_text(
+        f"⚠️ Quyidagi savolni butunlay o'chirmoqchimisiz? Bu amalni qaytarib bo'lmaydi.\n\n"
+        f"[ID:{qid}, {q['category']}]\n{qtext}",
+        reply_markup=keyboard,
+    )
+
+
+async def delquestion_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(update.effective_user.id):
+        await query.edit_message_text("⛔ Bu buyruq faqat adminlar uchun.")
+        return
+
+    if query.data == "delq_no":
+        await query.edit_message_text("❌ Bekor qilindi.")
+        return
+
+    qid = int(query.data.split("_")[-1])
+    try:
+        ok = await db.delete_question(qid)
+    except Exception:
+        logger.exception("Savolni o'chirishda xato (id=%s)", qid)
+        await query.edit_message_text("⚠️ O'chirishda xato yuz berdi.")
+        return
+
+    if ok:
+        await query.edit_message_text(f"🗑 Savol (ID:{qid}) muvaffaqiyatli o'chirildi.")
+    else:
+        await query.edit_message_text(f"⚠️ Savol (ID:{qid}) topilmadi yoki allaqachon o'chirilgan.")
 
 
 # =====================================================================
@@ -537,6 +727,83 @@ async def ai_chat_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# =====================================================================
+#              LOKAL AI (API kalitisiz, kompyuter/server ichida)
+# =====================================================================
+
+_local_llm = None
+_local_llm_load_failed = False
+
+
+def _get_local_llm():
+    """Modelni faqat birinchi so'ralganda yuklaydi (sekin, shuning uchun
+    dastur ishga tushishida emas, birinchi savolda yuklanadi)."""
+    global _local_llm, _local_llm_load_failed
+    if _local_llm is not None or _local_llm_load_failed:
+        return _local_llm
+    if not LOCAL_LLM_PATH:
+        return None
+    try:
+        from llama_cpp import Llama
+        logger.info("Lokal AI modeli yuklanmoqda: %s", LOCAL_LLM_PATH)
+        _local_llm = Llama(
+            model_path=LOCAL_LLM_PATH,
+            n_ctx=2048,
+            n_threads=4,
+            verbose=False,
+        )
+        logger.info("Lokal AI modeli tayyor.")
+    except Exception:
+        logger.exception("Lokal AI modelini yuklashda xato.")
+        _local_llm_load_failed = True
+        _local_llm = None
+    return _local_llm
+
+
+LOCAL_LLM_SYSTEM_PROMPT = (
+    "Siz o'zbek tilida javob beruvchi yordamchisiz. "
+    "Javoblaringiz qisqa, aniq va tushunarli bo'lsin."
+)
+
+
+def _run_local_llm(user_text: str):
+    llm = _get_local_llm()
+    if llm is None:
+        return None
+    try:
+        result = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": LOCAL_LLM_SYSTEM_PROMPT},
+                {"role": "user", "content": user_text},
+            ],
+            max_tokens=300,
+            temperature=0.7,
+        )
+        return result["choices"][0]["message"]["content"].strip()
+    except Exception:
+        logger.exception("Lokal AI javob generatsiyasida xato.")
+        return None
+
+
+async def generate_local_ai_reply(user_text: str):
+    """CPU-bog'liq (blocking) generatsiyani alohida thread'da ishga tushiradi,
+    shunda bot boshqa foydalanuvchilarga javob berishni to'xtatmaydi."""
+    return await asyncio.to_thread(_run_local_llm, user_text)
+
+
+GREETINGS = ["salom", "assalomu alaykum", "assalom", "hi", "hello", "salomlar", "vazalom"]
+HOWAREYOU = ["qalaysan", "qanaqasan", "yaxshimisan", "qandaysan", "ahvoling qanday"]
+HELP_TRIGGERS = [
+    "bu bot nima qiladi", "bot nima qiladi", "nima qila olasan", "nima qilolasan",
+    "nima qila oladi", "sen kimsan", "sen nimasan", "kimsan o'zing", "botni tanishtir",
+    "qanday ishlaysan", "imkoniyatlaring",
+]
+
+
+def _matches_any(text: str, patterns) -> bool:
+    return any(p in text for p in patterns)
+
+
 async def ai_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Faqat "AI bilan suhbat" rejimida bo'lgan foydalanuvchilarga javob beradi.
     # Boshqa holatlarda (masalan /addquestion jarayonida) bu handler ishlamaydi,
@@ -549,11 +816,48 @@ async def ai_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✏️ Iltimos, savolingizni to'liqroq yozing.")
         return
 
-    match = await db.find_similar_question(user_text, SIMILARITY_THRESHOLD)
-
     keyboard = InlineKeyboardMarkup(
         [[InlineKeyboardButton("🔙 Suhbatni tugatish", callback_data="ai_chat_stop")]]
     )
+
+    lower = user_text.lower()
+
+    # Qisqa, oddiy salomlashish/hol-ahvol xabarlariga tabiiy javob beramiz
+    # (uzunroq xabarlar haqiqiy test savoli bo'lishi mumkin, shuning uchun
+    # bu tekshiruvni faqat qisqa xabarlarga qo'llaymiz)
+    if len(user_text) <= 40:
+        if _matches_any(lower, GREETINGS):
+            await update.message.reply_text(
+                "👋 Salom! Men test savollariga oid kichik yordamchiman.\n"
+                "Menga test mavzusidagi biror savolni yozib ko'ring, masalan: "
+                "\"Naryad necha kunga beriladi?\"",
+                reply_markup=keyboard,
+            )
+            return
+        if _matches_any(lower, HOWAREYOU):
+            await update.message.reply_text(
+                "😊 Yaxshi, rahmat! Menga test mavzusidan biror savol yozsangiz, "
+                "bazadan javobini topib beraman.",
+                reply_markup=keyboard,
+            )
+            return
+
+    if _matches_any(lower, HELP_TRIGGERS):
+        await update.message.reply_text(
+            "🤖 Men shu botning kichik yordamchisiman (katta AI emasman).\n\n"
+            "<b>Nima qila olaman:</b>\n"
+            "• Test mavzulariga oid savollaringizga bazadagi savollar ichidan "
+            "eng yaqin javobni topib beraman.\n"
+            "  Masalan: <i>\"Naryad necha kunga beriladi?\"</i>\n\n"
+            "<b>Nima qila olmayman:</b>\n"
+            "• Test mavzusidan tashqari chuqur/umumiy savollarga to'liq javob berolmayman.\n\n"
+            "Testni topshirish uchun asosiy menyudagi \"🚀 Testni boshlash\" tugmasidan foydalaning.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+        return
+
+    match = await db.find_similar_question(user_text, SIMILARITY_THRESHOLD)
 
     if match:
         reply = (
@@ -562,14 +866,29 @@ async def ai_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ <b>Javob:</b> {match['correct_answer']}"
         )
         await update.message.reply_text(reply, parse_mode=ParseMode.HTML, reply_markup=keyboard)
-    else:
-        await update.message.reply_text(
-            "🤔 Kechirasiz, bu savolga bazamda mos javob topa olmadim.\n"
-            "Men kichik yordamchiman — faqat test mavzulariga oid savollarga "
-            "javob bera olaman. Iltimos, savolni boshqacharoq yoki aniqroq "
-            "so'rab ko'ring.",
-            reply_markup=keyboard,
-        )
+        return
+
+    # Bazadan aniq javob topilmadi — agar lokal AI model sozlangan bo'lsa, undan foydalanamiz
+    if LOCAL_LLM_PATH:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        ai_reply = await generate_local_ai_reply(user_text)
+        if ai_reply:
+            await update.message.reply_text(
+                f"🤖 {ai_reply}\n\n"
+                "<i>⚠️ Bu javob bazadagi tayyor javob emas, kichik lokal AI model "
+                "tomonidan generatsiya qilindi — noaniq bo'lishi mumkin.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+            return
+
+    await update.message.reply_text(
+        "🤔 Kechirasiz, bu savolga bazamda mos javob topa olmadim.\n"
+        "Men kichik yordamchiman — faqat test mavzulariga oid savollarga "
+        "javob bera olaman. Iltimos, savolni boshqacharoq yoki aniqroq "
+        "so'rab ko'ring.",
+        reply_markup=keyboard,
+    )
 
 
 # =====================================================================
@@ -607,7 +926,10 @@ async def admin_get_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if username_ok and password_ok:
         context.user_data["admin_authed"] = True
         keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("👥 Foydalanuvchilar ro'yxati", callback_data="admin_users")]]
+            [
+                [InlineKeyboardButton("👥 Foydalanuvchilar ro'yxati", callback_data="admin_users")],
+                [InlineKeyboardButton("📈 Umumiy statistika", callback_data="admin_stats")],
+            ]
         )
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
@@ -640,29 +962,95 @@ async def admin_users_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("Hozircha hech kim botdan foydalanmagan.")
         return
 
-    lines = [f"👥 <b>Jami foydalanuvchilar:</b> {total}\n"]
+    lines = [f"👥 Jami foydalanuvchilar: {total}\n"]
     for i, u in enumerate(users, start=1):
         name = u["full_name"] or "—"
         uname = f"@{u['username']}" if u["username"] else "—"
         joined = u["joined_at"].strftime("%Y-%m-%d %H:%M") if u["joined_at"] else "—"
-        lines.append(f"{i}. {name} ({uname}) — ID: <code>{u['telegram_id']}</code> — {joined}")
+        lines.append(f"{i}. {name} ({uname}) — ID: {u['telegram_id']} — {joined}")
 
     text = "\n".join(lines)
     # Telegram xabar chegarasi ~4096 belgi, shuning uchun bo'lib yuboramiz
+    chunks = []
     chunk = ""
     for line in text.split("\n"):
         if len(chunk) + len(line) + 1 > 3800:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=chunk, parse_mode=ParseMode.HTML)
+            chunks.append(chunk)
             chunk = ""
         chunk += line + "\n"
     if chunk:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=chunk, parse_mode=ParseMode.HTML)
+        chunks.append(chunk)
+
+    for c in chunks:
+        try:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=c)
+        except Exception:
+            logger.exception("Foydalanuvchilar ro'yxatini yuborishda xato.")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ Ro'yxatning bir qismini yuborishda xato yuz berdi (log'ga yozildi).",
+            )
 
     if total > 100:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=f"ℹ️ Faqat oxirgi 100 tasi ko'rsatildi (jami {total} ta).",
         )
+
+
+async def admin_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not context.user_data.get("admin_authed"):
+        await query.edit_message_text("⚠️ Avval /admin orqali kiring.")
+        return
+
+    stats = await db.get_overall_stats()
+    hardest = await db.get_hardest_questions(limit=10, min_attempts=5)
+
+    lines = [
+        "📈 Umumiy statistika\n",
+        f"👥 Foydalanuvchilar: {stats['users']}",
+        f"❓ Bazadagi savollar: {stats['questions']}",
+        f"📝 Topshirilgan testlar: {stats['quiz_attempts']}",
+        f"✅ Javob berilgan savollar (jami): {stats['answers_logged']}",
+        f"📊 O'rtacha natija: {stats['avg_percentage']}%\n",
+    ]
+
+    if hardest:
+        lines.append("🔥 Eng ko'p xato qilingan savollar (kamida 5 marta so'ralgan):\n")
+        for i, h in enumerate(hardest, start=1):
+            qtext = h["question_text"]
+            if len(qtext) > 90:
+                qtext = qtext[:90] + "…"
+            lines.append(
+                f"{i}. [ID:{h['id']}] {qtext}\n"
+                f"    ❌ {h['wrong_pct']}% xato ({h['wrong_count']}/{h['total_attempts']} urinish) — {h['category']}"
+            )
+    else:
+        lines.append("ℹ️ Hali yetarli statistika yig'ilmagan (kamida 5 marta javob berilgan savol yo'q).")
+
+    text = "\n".join(lines)
+    chunks = []
+    chunk = ""
+    for line in text.split("\n"):
+        if len(chunk) + len(line) + 1 > 3800:
+            chunks.append(chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk:
+        chunks.append(chunk)
+
+    for c in chunks:
+        try:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=c)
+        except Exception:
+            logger.exception("Statistikani yuborishda xato.")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ Hisobotning bir qismini yuborishda xato yuz berdi (log'ga yozildi).",
+            )
 
 
 
@@ -750,10 +1138,22 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    edit_question_conv = ConversationHandler(
+        entry_points=[CommandHandler("editquestion", editquestion_start)],
+        states={
+            EDIT_MENU: [CallbackQueryHandler(editquestion_menu_callback, pattern="^editf_")],
+            EDIT_WAIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, editquestion_receive_value)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(add_question_conv)
     application.add_handler(admin_login_conv)
+    application.add_handler(edit_question_conv)
+    application.add_handler(CommandHandler("delquestion", delquestion_start))
+    application.add_handler(CallbackQueryHandler(delquestion_confirm_callback, pattern="^delq_"))
     application.add_handler(CallbackQueryHandler(start_quiz_callback, pattern="^start_quiz$"))
     application.add_handler(CallbackQueryHandler(my_stats_callback, pattern="^my_stats$"))
     application.add_handler(CallbackQueryHandler(choose_category_callback, pattern="^cat_"))
@@ -761,6 +1161,7 @@ def main():
     application.add_handler(CallbackQueryHandler(ai_chat_start, pattern="^ai_chat$"))
     application.add_handler(CallbackQueryHandler(ai_chat_stop, pattern="^ai_chat_stop$"))
     application.add_handler(CallbackQueryHandler(admin_users_callback, pattern="^admin_users$"))
+    application.add_handler(CallbackQueryHandler(admin_stats_callback, pattern="^admin_stats$"))
     application.add_handler(PollAnswerHandler(poll_answer_callback))
     # E'tibor bering: bu handler ENG OXIRIDA qo'shilishi kerak, aks holda
     # /addquestion suhbati ichidagi matn xabarlarini "yeb qo'yishi" mumkin.
